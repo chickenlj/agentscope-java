@@ -17,11 +17,13 @@ package io.agentscope.harness.agent.middleware;
 
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.AgentBase;
+import io.agentscope.core.agent.RunOutcome;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
+import io.agentscope.core.journal.InvocationRecorder;
+import io.agentscope.core.journal.JournalException;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.middleware.AgentInput;
-import io.agentscope.core.session.SessionRecorder;
 import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.coordination.LocalPeriodicGate;
 import io.agentscope.harness.agent.coordination.PeriodicGate;
@@ -32,6 +34,7 @@ import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryConsolidator;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.EnumSet;
@@ -42,14 +45,17 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.util.context.ContextView;
 
 /**
  * Middleware that performs periodic memory maintenance after each agent call.
  *
- * <p>Fires on the agent invocation completion (via {@code onAgent doOnComplete}, after
- * {@link MemoryFlushMiddleware}) and is throttled by a configurable minimum gap so it
- * does not run on every single call. The maintenance is <em>fire-and-forget</em>: the agent
- * stream completes immediately while the maintenance runs on a background scheduler.
+ * <p>Fires on the agent stream's completion signal (after {@link MemoryFlushMiddleware}) and is
+ * throttled by a configurable minimum gap so it does not run on every single call. The
+ * maintenance is <em>fire-and-forget</em>: the agent stream completes immediately while the
+ * maintenance runs on a background scheduler. The completing subscription's Reactor context is
+ * replayed on that background subscription, so context-scoped instrumentation (token metering,
+ * tracing) on the consolidation model call sees the same context as the turn.
  *
  * <p>Maintenance steps executed in order:
  * <ol>
@@ -151,35 +157,39 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
         // updated synchronously, so a quiescence check can never observe an empty in-flight
         // set before the task is counted.
         return next.apply(input)
-                .doOnComplete(
-                        () -> {
-                            MemoryBackgroundTasks.begin();
-                            Mono.defer(() -> doMaintenance(rc))
-                                    .subscribeOn(Schedulers.boundedElastic())
-                                    .doFinally(signal -> MemoryBackgroundTasks.end())
-                                    .subscribe(
-                                            null,
-                                            e ->
-                                                    log.warn(
-                                                            "Memory maintenance failed: {}",
-                                                            e.getMessage()));
+                .doOnEach(
+                        signal -> {
+                            if (signal.isOnComplete()) {
+                                ContextView contextView = signal.getContextView();
+                                scheduleMaintenance(rc, contextView);
+                            }
                         });
     }
 
     @Override
     public Mono<Void> onAgentFinish(Agent agent, RuntimeContext rc, Msg result) {
         if (!Boolean.TRUE.equals(rc.get(MemoryFlushMiddleware.INLINE_CONTEXT_KEY))
-                || SessionRecorder.from(rc) == null
-                || !"completed".equals(SessionRecorder.outcome(result.getGenerateReason())))
+                || InvocationRecorder.from(rc) == null
+                || RunOutcome.fromResult(result).status() != RunOutcome.Status.COMPLETED)
             return Mono.empty();
         return Mono.defer(() -> doMaintenance(rc))
                 .subscribeOn(Schedulers.boundedElastic())
                 .contextWrite(context -> context.put(AgentBase.RUNTIME_CONTEXT_KEY, rc))
                 .onErrorResume(
                         error -> {
+                            if (JournalException.causedBy(error)) return Mono.error(error);
                             log.warn("Memory maintenance failed: {}", error.getMessage());
                             return Mono.empty();
                         });
+    }
+
+    private void scheduleMaintenance(RuntimeContext rc, ContextView contextView) {
+        MemoryBackgroundTasks.begin();
+        Mono.defer(() -> doMaintenance(rc))
+                .subscribeOn(Schedulers.boundedElastic())
+                .contextWrite(context -> context.putAll(contextView))
+                .doFinally(signal -> MemoryBackgroundTasks.end())
+                .subscribe(null, e -> log.warn("Memory maintenance failed: {}", e.getMessage()));
     }
 
     private Mono<Void> doMaintenance(RuntimeContext rc) {
@@ -188,7 +198,10 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
             // Mono completes.
             return Mono.empty();
         }
-        return runMaintenance(rc);
+        // Run as one reactive chain rather than a blocking body: the consolidator's model call
+        // must stay inside this subscription so it observes the replayed turn context.
+        return Mono.fromRunnable(() -> expireDailyFiles(rc))
+                .then(Mono.defer(() -> consolidateMemory(rc)));
     }
 
     /**
@@ -216,14 +229,18 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
         };
     }
 
-    private Mono<Void> runMaintenance(RuntimeContext rc) {
-        return Mono.fromRunnable(
-                        () -> {
-                            log.debug("Running memory maintenance...");
-                            expireDailyFiles(rc);
-                        })
-                .then(Mono.defer(() -> consolidateMemory(rc)))
-                .doOnSuccess(ignored -> log.debug("Memory maintenance completed"));
+    private Mono<Void> consolidateMemory(RuntimeContext rc) {
+        if (consolidator == null) {
+            return Mono.empty();
+        }
+        return consolidator
+                .consolidate(rc)
+                .onErrorResume(
+                        e -> {
+                            if (JournalException.causedBy(e)) return Mono.error(e);
+                            log.warn("Memory consolidation failed: {}", e.getMessage());
+                            return Mono.empty();
+                        });
     }
 
     private void expireDailyFiles(RuntimeContext rc) {
@@ -236,7 +253,10 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
             return;
         }
 
-        LocalDate cutoff = LocalDate.now().minusDays(dailyFileRetentionDays);
+        Clock clock = rc == null ? null : rc.get(Clock.class);
+        LocalDate cutoff =
+                LocalDate.now(clock == null ? Clock.systemDefaultZone() : clock)
+                        .minusDays(dailyFileRetentionDays);
         for (FileInfo fi : glob.matches()) {
             if (fi.isDirectory()) {
                 continue;
@@ -261,16 +281,6 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
                 // not a date-named file, skip
             }
         }
-    }
-
-    private Mono<Void> consolidateMemory(RuntimeContext rc) {
-        if (consolidator == null) return Mono.empty();
-        return Mono.defer(() -> consolidator.consolidate(rc))
-                .onErrorResume(
-                        error -> {
-                            log.warn("Memory consolidation failed: {}", error.getMessage());
-                            return Mono.empty();
-                        });
     }
 
     private static String fileName(String path) {

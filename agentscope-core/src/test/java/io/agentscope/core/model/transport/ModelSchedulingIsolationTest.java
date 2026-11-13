@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.ReActAgent;
+import io.agentscope.core.journal.InMemoryThreadJournalStore;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.model.ChatResponse;
@@ -28,7 +29,6 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ModelSchedulers;
 import io.agentscope.core.model.ToolSchema;
-import io.agentscope.core.session.InMemorySessionLogStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -183,6 +183,7 @@ class ModelSchedulingIsolationTest {
                                             .responseTimeout(Duration.ofMillis(100))
                                             .build())
                             .build();
+            JdkHttpTransport recovery = null;
             try {
                 StepVerifier.create(transport.stream(request(server)))
                         .expectErrorMatches(
@@ -191,17 +192,19 @@ class ModelSchedulingIsolationTest {
                                                 && error.getMessage().contains("Stream timeout"))
                         .verify(Duration.ofSeconds(2));
                 assertEquals(0, server.getRequestCount());
+                recovery = JdkHttpTransport.builder().streamScheduler(reads).build();
                 server.enqueue(new MockResponse().setBody("data: next\n\ndata: [DONE]\n\n"));
                 release.countDown();
                 assertEquals(
                         List.of("next"),
-                        transport.stream(request(server))
+                        recovery.stream(request(server))
                                 .collectList()
                                 .block(Duration.ofSeconds(2)));
                 assertEquals(
                         1, server.getRequestCount(), "The timed-out queued send must never run");
             } finally {
                 release.countDown();
+                if (recovery != null) recovery.close();
                 transport.close();
             }
         } finally {
@@ -296,7 +299,7 @@ class ModelSchedulingIsolationTest {
                             ReActAgent.builder()
                                     .name("isolated")
                                     .model(model)
-                                    .sessionLogStore(new InMemorySessionLogStore())
+                                    .threadJournalStore(new InMemoryThreadJournalStore())
                                     .build();
                     assertEquals(
                             "answer",
